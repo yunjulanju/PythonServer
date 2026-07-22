@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>UE5 ↔ llama.cpp 중계 FastAPI 서버 — 설계 문서</title>
+<style>
+  :root {
+    --bg: #ffffff; --fg: #1a1a1a; --muted: #666; --border: #e2e2e2;
+    --accent: #2563eb; --code-bg: #f5f5f7; --th-bg: #f0f4ff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #16181d; --fg: #e6e6e6; --muted: #9aa0aa; --border: #2c2f36;
+      --accent: #6ea8fe; --code-bg: #1e2128; --th-bg: #1c2333;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font-family: -apple-system, "Segoe UI", "Malgun Gothic", sans-serif;
+    line-height: 1.65; font-size: 16px;
+  }
+  main { max-width: 860px; margin: 0 auto; padding: 3rem 1.5rem 5rem; }
+  h1 { font-size: 1.9rem; line-height: 1.25; margin: 0 0 .5rem; }
+  h2 { font-size: 1.35rem; margin: 2.5rem 0 .8rem; padding-bottom: .3rem; border-bottom: 2px solid var(--border); }
+  h3 { font-size: 1.1rem; margin: 1.6rem 0 .5rem; }
+  a { color: var(--accent); }
+  .meta { color: var(--muted); font-size: .92rem; margin-bottom: 2rem; }
+  .meta strong { color: var(--fg); }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: .93rem; display: block; overflow-x: auto; }
+  th, td { border: 1px solid var(--border); padding: .5rem .75rem; text-align: left; vertical-align: top; }
+  th { background: var(--th-bg); font-weight: 600; }
+  code { background: var(--code-bg); padding: .12em .4em; border-radius: 4px; font-size: .88em;
+    font-family: "SF Mono", Consolas, "Courier New", monospace; }
+  pre { background: var(--code-bg); padding: 1rem; border-radius: 8px; overflow-x: auto;
+    border: 1px solid var(--border); font-size: .85rem; line-height: 1.5; }
+  pre code { background: none; padding: 0; }
+  blockquote { border-left: 3px solid var(--accent); margin: 1rem 0; padding: .3rem 1rem;
+    color: var(--muted); background: var(--code-bg); border-radius: 0 6px 6px 0; }
+  .badge { display: inline-block; background: var(--accent); color: #fff; font-size: .78rem;
+    padding: .15em .6em; border-radius: 999px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>UE5 ↔ llama.cpp 중계 FastAPI 서버 — 설계 문서</h1>
+  <p class="meta">
+    <strong>작성일:</strong> 2026-07-16 &nbsp;·&nbsp;
+    <strong>상태:</strong> <span class="badge">설계 승인됨</span> 구현 계획 대기 &nbsp;·&nbsp;
+    <strong>목적:</strong> UE5의 NPC가 로컬 LLM(llama.cpp)과 실시간 대화하도록 Python(FastAPI) 중계 서버 구축
+  </p>
+
+  <h2>1. 배경 및 목표</h2>
+  <p>UE5의 NPC가 플레이어와 실시간으로 대화한다. llama.cpp 서버는 <code>http://127.0.0.1:8080</code>에서 OpenAI 호환 API로 이미 구동 중이다. Python 서버는 그 사이를 중계하며, NPC별 성격과 플레이어별 대화 히스토리를 다룬다.</p>
+  <p><strong>범위:</strong> 로컬 단일 프로세스 프로토타입. 저장·확장 지점은 인터페이스로 분리해 나중에 확장 가능하게 둔다.</p>
+
+  <h3>핵심 설계 결정 (브레인스토밍 결과)</h3>
+  <table>
+    <tr><th>#</th><th>결정</th><th>선택</th></tr>
+    <tr><td>1</td><td>히스토리 지속성</td><td>인메모리로 시작, <code>HistoryStore</code> 인터페이스로 분리해 나중에 SQLite/파일 교체</td></tr>
+    <tr><td>2</td><td>NPC 페르소나 소유</td><td><strong>UE5(DataAsset)가 소유</strong>, 요청마다 서버로 전송</td></tr>
+    <tr><td>3</td><td>히스토리 소유</td><td><strong>서버가 소유</strong>, <code>(player_id, npc_id)</code> 키로 보관</td></tr>
+    <tr><td>4</td><td>응답 방식</td><td>스트리밍 없음. <code>POST /chat</code> → JSON 하나</td></tr>
+    <tr><td>5</td><td>히스토리 관리</td><td>최근 N턴 슬라이딩 윈도우 (N은 설정값)</td></tr>
+    <tr><td>6</td><td>오류 처리</td><td>항상 HTTP 200 + JSON 내 <code>ok</code>/<code>error</code> 필드. 타임아웃도 설정값</td></tr>
+  </table>
+
+  <h2>2. 아키텍처 개요</h2>
+  <pre><code>UE5 (NPC)  ──HTTP/JSON──▶  FastAPI 서버  ──OpenAI 호환 API──▶  llama.cpp (127.0.0.1:8080)
+   │                          │
+   │  npc_id, player_id,      │  ┌─ 히스토리 저장소 (인메모리, 교체 가능)
+   │  system_prompt,          │  ├─ 프롬프트 조립 (persona + context + history)
+   │  context, message        │  └─ llama.cpp 클라이언트 (타임아웃 처리)
+   ▼                          ▼
+ 단순 JSON 응답  ◀────────────┘</code></pre>
+
+  <h3>역할 분담</h3>
+  <table>
+    <tr><th>데이터</th><th>성격</th><th>사는 곳</th></tr>
+    <tr><td>페르소나 (system prompt)</td><td>저작 데이터 (기획 콘텐츠)</td><td>UE5 DataAsset (요청마다 전송)</td></tr>
+    <tr><td>상황 컨텍스트</td><td>매 턴 바뀌는 런타임 정보</td><td>UE5 (요청마다 전송)</td></tr>
+    <tr><td>대화 히스토리</td><td>런타임 상태 (LLM 로직과 결합)</td><td>Python 서버 (<code>player_id</code>+<code>npc_id</code> 키)</td></tr>
+  </table>
+
+  <h2>3. API 계약</h2>
+  <h3><code>POST /chat</code> — 대화 한 턴</h3>
+  <p><strong>요청</strong></p>
+  <pre><code>{
+  "player_id": "player_42",
+  "npc_id": "blacksmith_bob",
+  "system_prompt": "너는 무뚝뚝한 대장장이 Bob이다. 말수가 적고 퉁명스럽다.",
+  "context": "플레이어가 방금 잃어버린 망치를 돌려줬다. 고마워하는 중.",
+  "message": "안녕, 대장장이 아저씨"
+}</code></pre>
+  <ul>
+    <li><code>player_id</code>, <code>npc_id</code>, <code>system_prompt</code>, <code>message</code> — 필수</li>
+    <li><code>context</code> — 선택 (이번 턴 상황). 서버가 <code>system_prompt</code>와 합쳐 최종 system 메시지로 구성</li>
+    <li><code>message</code> — 플레이어의 이번 발화. 서버가 저장된 히스토리 뒤에 붙여 llama.cpp로 전달</li>
+  </ul>
+  <p><strong>응답 (항상 HTTP 200)</strong></p>
+  <pre><code>// 성공
+{ "reply": "흥, 또 왔군.", "ok": true, "npc_id": "blacksmith_bob", "turn_count": 3 }
+
+// 실패
+{ "reply": "", "ok": false, "error": "llm_unavailable", "npc_id": "blacksmith_bob" }</code></pre>
+  <ul>
+    <li><code>error</code> 값: <code>llm_unavailable</code> (연결 실패) / <code>llm_timeout</code> (타임아웃 초과)</li>
+    <li><code>turn_count</code> — 현재 저장된 히스토리 턴 수 (디버깅용)</li>
+  </ul>
+
+  <h3><code>POST /reset</code> — 특정 (player, npc) 히스토리 비우기</h3>
+  <pre><code>// 요청
+{ "player_id": "player_42", "npc_id": "blacksmith_bob" }
+// 응답
+{ "ok": true }</code></pre>
+  <p>플레이어가 자리를 뜨거나 새 게임을 시작할 때 호출.</p>
+
+  <h3><code>GET /health</code> — 서버 및 llama.cpp 연결 확인 (개발용)</h3>
+  <p>서버 자체 상태와 llama.cpp 도달 가능 여부를 반환.</p>
+
+  <h2>4. 내부 구성요소</h2>
+  <p>각 유닛은 하나의 책임만 가지며 독립적으로 테스트 가능하다.</p>
+  <table>
+    <tr><th>파일</th><th>책임</th><th>의존</th></tr>
+    <tr><td><code>main.py</code></td><td>FastAPI 앱, 엔드포인트, 요청/응답 Pydantic 모델</td><td>전부</td></tr>
+    <tr><td><code>history.py</code></td><td><code>HistoryStore</code> 인터페이스 + <code>InMemoryHistoryStore</code>. <code>(player_id, npc_id)</code> 키, 최근 N턴 슬라이딩 윈도우. <strong>← 나중에 SQLite 교체 지점</strong></td><td>config</td></tr>
+    <tr><td><code>llm_client.py</code></td><td>llama.cpp 호출 (httpx). 타임아웃/연결오류를 잡아 결과로 반환</td><td>config</td></tr>
+    <tr><td><code>prompt.py</code></td><td><code>system_prompt + context + 히스토리 + message</code> → OpenAI <code>messages</code> 배열 조립</td><td>없음 (순수)</td></tr>
+    <tr><td><code>config.py</code></td><td>설정값 로딩 (환경변수 / <code>.env</code>)</td><td>없음</td></tr>
+  </table>
+
+  <h2>5. 설정값 (<code>config.py</code>)</h2>
+  <table>
+    <tr><th>값</th><th>기본</th><th>의미</th></tr>
+    <tr><td><code>LLAMA_BASE_URL</code></td><td><code>http://127.0.0.1:8080</code></td><td>llama.cpp 주소</td></tr>
+    <tr><td><code>MAX_HISTORY_TURNS</code></td><td><code>10</code></td><td>유지할 최근 턴 수 (N)</td></tr>
+    <tr><td><code>REQUEST_TIMEOUT</code></td><td><code>30</code></td><td>llama.cpp 호출 타임아웃(초)</td></tr>
+    <tr><td><code>LLAMA_MODEL</code></td><td><code>local</code></td><td>OpenAI 호환 요청의 <code>model</code> 필드 값</td></tr>
+  </table>
+  <blockquote>"턴"의 정의: user 발화 1 + assistant 응답 1 = 1턴. 슬라이딩 윈도우는 최근 <code>MAX_HISTORY_TURNS</code>턴을 유지.</blockquote>
+
+  <h2>6. 대화 흐름 (<code>/chat</code>)</h2>
+  <ol>
+    <li>요청 파싱 → <code>(player_id, npc_id)</code>로 히스토리 조회</li>
+    <li><code>prompt.py</code>가 messages 배열 조립: <code>[system(system_prompt+context)] + 최근 N턴 + [새 user message]</code></li>
+    <li><code>llm_client.py</code>가 llama.cpp 호출 (타임아웃 적용)</li>
+    <li><strong>성공</strong> → assistant reply를 히스토리에 append (윈도우 초과 시 가장 오래된 턴 폐기), <code>ok:true</code> 반환</li>
+    <li><strong>실패</strong> → 히스토리 <strong>변경하지 않음</strong>, <code>ok:false</code> + <code>error</code> 반환</li>
+  </ol>
+  <blockquote>실패 시 히스토리를 건드리지 않는 이유: 재시도 시 대화 일관성을 유지하고, 반쪽짜리 턴(user만 있고 assistant 없음)이 남지 않게 하기 위함.</blockquote>
+
+  <h2>7. 테스트 전략 (TDD)</h2>
+  <table>
+    <tr><th>대상</th><th>테스트</th></tr>
+    <tr><td><code>history.py</code></td><td>append / 조회 / N턴 트리밍 / reset — 순수 로직, LLM 불필요</td></tr>
+    <tr><td><code>prompt.py</code></td><td>messages 배열 조립 정확성 (system 합성, 턴 순서)</td></tr>
+    <tr><td><code>llm_client.py</code></td><td>llama.cpp를 mock — 성공 / 타임아웃 / 연결실패 3케이스</td></tr>
+    <tr><td><code>/chat</code> 통합</td><td>llama.cpp mock — 정상 응답 + 실패 시 <code>ok:false</code> 검증</td></tr>
+    <tr><td><code>/reset</code> 통합</td><td>히스토리 비워지는지 검증</td></tr>
+  </table>
+
+  <h2>8. 향후 확장 지점 (범위 밖, 자리만 마련)</h2>
+  <ul>
+    <li><strong>저장소 교체:</strong> <code>HistoryStore</code> 인터페이스에 <code>SQLiteHistoryStore</code> 등 추가</li>
+    <li><strong>히스토리 관리 고도화:</strong> 슬라이딩 윈도우 → 토큰 기준 트리밍 또는 오래된 대화 요약</li>
+    <li><strong>폴백 대사:</strong> <code>ok:false</code>일 때 NPC가 얼버무리는 기본 대사 (UE5 또는 서버에서)</li>
+    <li><strong>스트리밍:</strong> 필요 시 SSE 엔드포인트 추가</li>
+  </ul>
+</main>
+</body>
+</html>
